@@ -1,5 +1,7 @@
 package org.cduggan;
 
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import java.io.*;
 import java.net.Socket;
 import java.net.URL;
@@ -10,37 +12,40 @@ public class ConnectionHandler {
     private final InputStream clientInput;
     private final OutputStream clientOutput;
     private final String requestLine;
+    private Policy policy;
+    private final String requesterIp;
+    private boolean FAIL_OPEN = true;
 
-    public ConnectionHandler(InputStream clientInput, OutputStream clientOutput, String requestLine) {
+    public ConnectionHandler(InputStream clientInput, OutputStream clientOutput, String requestLine, Policy policy, String requesterIp) {
         this.clientInput = clientInput;
         this.clientOutput = clientOutput;
         this.requestLine = requestLine;
+        this.policy = policy;
+        this.requesterIp = requesterIp;
     }
 
     public void handleConnection() throws IOException {
         String[] requestParts = requestLine.split(" ");
         String method = requestParts[0];
-        String url = requestParts[1];
+        String urlStr = requestParts[1];
 
-        Logger.log("Processing request for URL: " + url, false);
-        if (isDeniedUrl(url)) {
-            denyAccess();
-        } else if (method.equals("CONNECT")) {
-            Logger.log("Handling HTTPS connection for URL: " + url, true);
-            handleConnect(url);
-        } else {
-            Logger.log("Handling HTTP request to URL: " + url, true);
-            handleHttpRequest();
-        }
-    }
+        Logger.log("Processing request for URL: " + urlStr + " from IP: " + requesterIp, false);
 
-    private boolean isDeniedUrl(String url) {
         try {
-            URL parsedUrl = new URL("http://" + url);
-            return parsedUrl.getHost().contains(DENIED_URL);
+            URL url = new URL("http://" + urlStr);
+            if (policy.checkAndLogAccess(url, requesterIp)) {
+                System.out.println("Denyinh");
+                denyAccess();
+            } else if (method.equals("CONNECT")) {
+                Logger.log("Handling HTTPS connection for URL: " + urlStr, true);
+                handleConnect(urlStr);
+            } else {
+                Logger.log("Handling HTTP request to URL: " + urlStr, true);
+                handleHttpRequest();
+            }
         } catch (Exception e) {
-            Logger.log("Error parsing URL: " + e.getMessage(), true);
-            return false;
+            Logger.log("Error processing URL: " + e.getMessage(), true);
+            denyAccess();
         }
     }
 
@@ -93,27 +98,38 @@ public class ConnectionHandler {
 
         Logger.log("Establishing HTTPS tunnel to " + host + ":" + port, true);
 
-        try (Socket serverSocket = new Socket(host, port)) {
+        try {
             clientOutput.write("HTTP/1.1 200 Connection Established\r\n\r\n".getBytes());
             clientOutput.flush();
 
-            try (InputStream serverInput = serverSocket.getInputStream();
-                 OutputStream serverOutput = serverSocket.getOutputStream()) {
+            // Establish SSL connection
+            SSLSocketFactory sslSocketFactory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            try (SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(host, port)) {
+                sslSocket.startHandshake();
 
-                Thread clientToServer = new Thread(() -> forwardData(clientInput, serverOutput, "Client to Server"));
-                Thread serverToClient = new Thread(() -> forwardData(serverInput, clientOutput, "Server to Client"));
+                String cipherSuite = sslSocket.getSession().getCipherSuite();
+                Logger.log("Cipher Suite used: " + cipherSuite, true);
 
-                clientToServer.start();
-                serverToClient.start();
-                clientToServer.join();
-                serverToClient.join();
+                // Forward data between client and server using SSL socket
+                try (InputStream serverInput = sslSocket.getInputStream();
+                     OutputStream serverOutput = sslSocket.getOutputStream()) {
 
-                Logger.log("HTTPS tunnel closed.", true);
+                    Thread clientToServer = new Thread(() -> forwardData(clientInput, serverOutput, "Client to Server"));
+                    Thread serverToClient = new Thread(() -> forwardData(serverInput, clientOutput, "Server to Client"));
+
+                    clientToServer.start();
+                    serverToClient.start();
+                    clientToServer.join();
+                    serverToClient.join();
+
+                    Logger.log("HTTPS tunnel closed.", true);
+                }
             }
         } catch (IOException | InterruptedException e) {
             Logger.log("Error in HTTPS tunnel: " + e.getMessage(), true);
         }
     }
+
 
     private void forwardData(InputStream input, OutputStream output, String direction) {
         byte[] buffer = new byte[8192];
@@ -126,6 +142,14 @@ public class ConnectionHandler {
             }
         } catch (IOException e) {
             Logger.log("Error during " + direction + ": " + e.getMessage(), true);
+        } finally {
+            try {
+                input.close();
+                output.close();
+            } catch (IOException e) {
+                Logger.log("Error closing streams in " + direction + ": " + e.getMessage(), true);
+            }
         }
     }
+
 }
